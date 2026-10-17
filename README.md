@@ -1,7 +1,7 @@
 <div align="center">
 
 # SACH
-### Smart Attendance & Compliance Hub
+## Smart Attendance & Compliance Hub
 
 **A role-aware monitoring and audit prototype for training-centre attendance and infrastructure compliance.**
 
