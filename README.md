@@ -71,8 +71,8 @@ The risk engine can use the rolling median of camera headcount samples over a te
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/KananSangal/S.A.C.H..git
-cd S.A.C.H.
+git clone https://github.com/KananSangal/Project-S.A.C.H..git
+cd Project-S.A.C.H.
 ```
 
 ### 2. Set up the backend
