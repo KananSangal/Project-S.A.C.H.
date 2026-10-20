@@ -2,12 +2,15 @@ import base64
 import asyncio
 import json
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.websockets import WebSocketDisconnect
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -51,6 +54,7 @@ class ApiBehaviorTests(unittest.TestCase):
         sach.db_store["attendance_logs"] = []
         sach.db_store["audit_logs"] = []
         sach.db_store["centres"] = {}
+        sach.live_infrastructure.clear()
 
     def tearDown(self):
         self.db.close()
@@ -58,6 +62,7 @@ class ApiBehaviorTests(unittest.TestCase):
         sach.db_store["attendance_logs"] = []
         sach.db_store["audit_logs"] = []
         sach.db_store["centres"] = {}
+        sach.live_infrastructure.clear()
 
     @staticmethod
     def request_for(username, role=None, centre_id=None):
@@ -107,6 +112,311 @@ class ApiBehaviorTests(unittest.TestCase):
         }
         return Request(scope)
 
+    def test_live_feed_replays_latest_frame_for_exact_centre_and_stream(self):
+        class MemoryWebSocket:
+            def __init__(self):
+                self.accepted = False
+                self.messages = []
+
+            async def accept(self):
+                self.accepted = True
+
+            async def send_json(self, message):
+                self.messages.append(message)
+
+        manager = sach.ConnectionManager()
+        delhi_feed = MemoryWebSocket()
+        jaipur_feed = MemoryWebSocket()
+
+        async def prepare_feeds():
+            await manager.broadcast(
+                "DELHI_001",
+                "attendance",
+                {"frame": "delhi-frame", "camera_id": "DELHI_001:camera-0"},
+            )
+            await manager.broadcast("JAIPUR_001", "attendance", {"frame": "jaipur-frame"})
+            await manager.broadcast("DELHI_001", "infrastructure", {"frame": "audit-frame"})
+            await manager.connect(delhi_feed, "DELHI_001", "attendance")
+            await manager.connect(jaipur_feed, "JAIPUR_001", "attendance")
+
+        asyncio.run(prepare_feeds())
+
+        self.assertTrue(delhi_feed.accepted)
+        self.assertTrue(jaipur_feed.accepted)
+        self.assertEqual(delhi_feed.messages[0]["frame"], "delhi-frame")
+        self.assertEqual(delhi_feed.messages[0]["centre_id"], "DELHI_001")
+        self.assertEqual(delhi_feed.messages[0]["stream_type"], "attendance")
+        self.assertEqual(delhi_feed.messages[0]["camera_id"], "DELHI_001:camera-0")
+        self.assertEqual(jaipur_feed.messages[0]["frame"], "jaipur-frame")
+        self.assertIn("received_at", delhi_feed.messages[0])
+        self.assertNotEqual(delhi_feed.messages[0]["frame"], "audit-frame")
+
+    def test_websocket_authorization_enforces_role_and_operator_centre_scope(self):
+        operator = {"role": "CENTRE_OPERATOR", "centre_id": "TEST_001"}
+        official = {"role": "OFFICIAL", "centre_id": None}
+        auditor = {"role": "AUDITOR", "centre_id": None}
+
+        self.assertTrue(sach._websocket_role_allowed(
+            operator, "TEST_001", "attendance", upload=True
+        ))
+        self.assertFalse(sach._websocket_role_allowed(
+            operator, "OTHER_001", "attendance", upload=True
+        ))
+        self.assertFalse(sach._websocket_role_allowed(
+            operator, "TEST_001", "infra", upload=True
+        ))
+        self.assertTrue(sach._websocket_role_allowed(
+            official, "TEST_001", "infra", upload=True
+        ))
+        self.assertFalse(sach._websocket_role_allowed(
+            auditor, "TEST_001", "infra", upload=True
+        ))
+        self.assertFalse(sach._websocket_role_allowed(
+            official, "TEST_001", "unknown", upload=False
+        ))
+
+    def test_authenticated_live_api_and_websocket_use_transient_configured_metrics(self):
+        user = sach.AuthUser(
+            username="live-stream-official",
+            password_hash=sach._hash_password("correct-horse-battery-staple"),
+            role="OFFICIAL",
+            created_at=sach._utc_now().isoformat(),
+        )
+        token = sach.secrets.token_urlsafe(24)
+        self.db.add(user)
+        self.db.flush()
+        self.db.add(sach.AuthSession(
+            user_id=user.id,
+            token_hash=sach.hashlib.sha256(token.encode()).hexdigest(),
+            expires_at=(sach._utc_now() + sach.timedelta(minutes=5)).isoformat(),
+        ))
+        self.db.commit()
+        sach.db_store["centres"]["TEST_001"] = sach.centre_to_dict(
+            self.db.get(sach.CentreRecord, "TEST_001")
+        )
+        client = TestClient(sach.app)
+
+        with patch.object(sach, "SessionLocal", self.session_factory):
+            unauthorized = client.post(
+                "/api/audit/live",
+                json={"centre_id": "TEST_001", "detected_computers": 5},
+            )
+            self.assertEqual(unauthorized.status_code, 401)
+
+            headers = {"Authorization": f"Bearer {token}"}
+            response = client.post(
+                "/api/audit/live",
+                json={"centre_id": "TEST_001", "detected_computers": 5},
+                headers=headers,
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.json()["live"]["compliance_percentage"], 50
+            )
+            self.assertEqual(
+                self.db.query(sach.AuditRecord).count(), 0
+            )
+
+            with client.websocket_connect(
+                "/ws/stream_upload/TEST_001/infra"
+            ) as websocket:
+                websocket.send_json({"type": "auth", "token": token})
+                self.assertEqual(
+                    websocket.receive_json()["type"], "authenticated"
+                )
+                websocket.send_json({
+                    "frame": "encoded-frame",
+                    "source_stream": "attendance",
+                    "source_centre_id": "TEST_001",
+                    "camera_id": "TEST_001:camera-0",
+                    "detected_computers": 5,
+                    "required_computers": 15,
+                    "compliance_percentage": 100,
+                    "status": "COMPLIANT",
+                })
+
+            with self.assertRaises(WebSocketDisconnect):
+                with client.websocket_connect(
+                    "/ws/stream_upload/TEST_001/infra"
+                ) as websocket:
+                    websocket.send_json({"type": "auth", "token": token})
+                    self.assertEqual(
+                        websocket.receive_json()["type"], "authenticated"
+                    )
+                    websocket.send_json({
+                        "frame": "wrong-centre-frame",
+                        "source_stream": "attendance",
+                        "source_centre_id": "OTHER_001",
+                        "camera_id": "OTHER_001:camera-0",
+                        "detected_computers": 5,
+                    })
+                    websocket.receive_json()
+
+        cached_frame = sach.connection_manager.latest_frames[
+            ("TEST_001", "infra")
+        ]
+        self.assertEqual(cached_frame["required_computers"], 10)
+        self.assertEqual(cached_frame["compliance_percentage"], 50.0)
+        self.assertEqual(cached_frame["status"], "PARTIAL")
+        self.assertEqual(cached_frame["centre_id"], "TEST_001")
+        self.assertEqual(cached_frame["stream_type"], "infra")
+        self.assertEqual(cached_frame["camera_id"], "TEST_001:camera-0")
+        sach.connection_manager.latest_frames.pop(("TEST_001", "infra"), None)
+
+    def test_infrastructure_frame_must_identify_same_centre_attendance_source(self):
+        valid = {
+            "source_stream": "attendance",
+            "source_centre_id": "TEST_001",
+            "camera_id": "TEST_001:camera-0",
+        }
+        self.assertTrue(sach._infra_frame_matches_source("TEST_001", valid))
+        self.assertFalse(sach._infra_frame_matches_source(
+            "TEST_001", {**valid, "source_centre_id": "OTHER_001"}
+        ))
+        self.assertFalse(sach._infra_frame_matches_source(
+            "TEST_001", {**valid, "source_stream": "infra"}
+        ))
+        self.assertFalse(sach._infra_frame_matches_source(
+            "TEST_001", {**valid, "camera_id": ""}
+        ))
+
+    def test_websocket_session_lookup_rejects_expired_or_revoked_sessions(self):
+        user = sach.AuthUser(
+            username="stream-user",
+            password_hash=sach._hash_password("correct-horse-battery-staple"),
+            role="OFFICIAL",
+            created_at=sach._utc_now().isoformat(),
+        )
+        token = "stream-session-token"
+        self.db.add(user)
+        self.db.flush()
+        session = sach.AuthSession(
+            user_id=user.id,
+            token_hash=sach.hashlib.sha256(token.encode()).hexdigest(),
+            expires_at=(sach._utc_now() + sach.timedelta(minutes=5)).isoformat(),
+        )
+        self.db.add(session)
+        self.db.commit()
+
+        with patch.object(sach, "SessionLocal", self.session_factory):
+            self.assertEqual(sach._lookup_websocket_user(token)["role"], "OFFICIAL")
+            self.assertTrue(asyncio.run(
+                sach._websocket_session_is_valid(
+                    token, "TEST_001", "attendance", upload=False
+                )
+            ))
+
+            session.revoked_at = sach._utc_now().isoformat()
+            self.db.commit()
+            self.assertIsNone(sach._lookup_websocket_user(token))
+            self.assertFalse(asyncio.run(
+                sach._websocket_session_is_valid(
+                    token, "TEST_001", "attendance", upload=False
+                )
+            ))
+
+    def test_live_infrastructure_update_uses_config_without_persisting_audit(self):
+        centre = self.db.get(sach.CentreRecord, "TEST_001")
+        audit_count = self.db.query(sach.AuditRecord).count()
+        original_compliance = centre.compliance_percentage
+        original_status = centre.status
+
+        response = sach.submit_live_infrastructure(
+            sach.LiveInfrastructureUpdate(
+                centre_id="TEST_001",
+                detected_computers=5,
+                timestamp=sach._utc_now().isoformat(),
+            ),
+            self.db,
+        )
+
+        self.assertEqual(response["live"]["required_computers"], 10)
+        self.assertEqual(response["live"]["compliance_percentage"], 50)
+        self.assertEqual(response["live"]["status"], "PARTIAL")
+        self.assertEqual(self.db.query(sach.AuditRecord).count(), audit_count)
+        self.assertEqual(centre.compliance_percentage, original_compliance)
+        self.assertEqual(centre.status, original_status)
+        self.assertEqual(sach.live_infrastructure["TEST_001"], response["live"])
+
+    def test_dashboard_stats_include_latest_attendance_and_live_infrastructure(self):
+        timestamp = sach._utc_now().isoformat()
+        sach.log_attendance(
+            sach.AttendanceLog(
+                centre_id="TEST_001",
+                live_headcount=6,
+                timestamp=timestamp,
+            ),
+            self.request_for("test-user"),
+            self.db,
+        )
+        sach.submit_live_infrastructure(
+            sach.LiveInfrastructureUpdate(
+                centre_id="TEST_001",
+                detected_computers=5,
+                timestamp=timestamp,
+            ),
+            self.db,
+        )
+
+        response = sach.get_dashboard_stats(self.db)
+
+        self.assertEqual(
+            response["centres"]["TEST_001"]["live_headcount"],
+            6,
+        )
+        self.assertEqual(
+            response["centres"]["TEST_001"]["last_attendance_at"],
+            timestamp,
+        )
+        self.assertEqual(
+            response["live_infrastructure"]["TEST_001"]["detected_computers"],
+            5,
+        )
+        self.assertEqual(
+            response["live_infrastructure"]["TEST_001"]["compliance_percentage"],
+            50,
+        )
+
+    def test_live_compliance_uses_each_centres_configured_computer_target(self):
+        for centre_id, detected, expected_required, expected_compliance in (
+            ("DELHI_001", 9, 15, 60.0),
+            ("LUCKNOW_002", 20, 25, 80.0),
+            ("MUMBAI_003", 15, 30, 50.0),
+        ):
+            source = sach.INITIAL_CENTRES[centre_id]
+            centre = {
+                "required_computers": source["required_computers"],
+                "equipment_config": json.loads(source["equipment_config"]),
+            }
+            with self.subTest(centre_id=centre_id):
+                result = sach._live_computer_compliance(centre, detected)
+                self.assertEqual(result["required_computers"], expected_required)
+                self.assertEqual(
+                    result["compliance_percentage"], expected_compliance
+                )
+
+    def test_infrastructure_websocket_replaces_client_compliance_with_centre_config(self):
+        source = sach.INITIAL_CENTRES["LUCKNOW_002"]
+        sach.db_store["centres"]["LUCKNOW_002"] = {
+            "required_computers": source["required_computers"],
+            "equipment_config": json.loads(source["equipment_config"]),
+        }
+        message = {
+            "frame": "encoded-frame",
+            "detected_computers": 20,
+            "required_computers": 15,
+            "compliance_percentage": 100,
+            "status": "COMPLIANT",
+        }
+
+        canonical = sach._canonical_live_infrastructure_message(
+            "LUCKNOW_002", message
+        )
+
+        self.assertEqual(canonical["required_computers"], 25)
+        self.assertEqual(canonical["compliance_percentage"], 80.0)
+        self.assertEqual(canonical["status"], "COMPLIANT")
+
     def test_attendance_validation_and_unknown_centre(self):
         with self.assertRaises(ValueError):
             sach.AttendanceLog(
@@ -119,6 +429,11 @@ class ApiBehaviorTests(unittest.TestCase):
                 live_headcount=5,
                 timestamp="not-a-timestamp",
             )
+        local_naive = datetime(2026, 10, 20, 11, 0, 0)
+        self.assertEqual(
+            sach._as_utc_datetime(local_naive).isoformat(),
+            "2026-10-20T11:00:00+00:00",
+        )
         with self.assertRaises(HTTPException) as raised:
             sach.log_attendance(
                 sach.AttendanceLog(
@@ -658,13 +973,33 @@ class ApiBehaviorTests(unittest.TestCase):
             90,
         )
 
-    def test_simulated_scan_persists_evidence_without_changing_centre_metrics(self):
+    def test_dev2_scan_persists_original_and_annotated_evidence(self):
         image_bytes = b"\xff\xd8\xff" + b"test-image-data" * 4
         image = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode()
+        annotated_image = "data:image/jpeg;base64,annotated"
         request = sach.ScanSubmission(
             centre_id="TEST_001",
             base64_images=[image] * 4,
         )
+        inference = {
+            "model": "equipment_yolo11n_v2.pt",
+            "device": "cpu",
+            "supported_classes": ["chair", "computer", "desk", "printer", "projector", "whiteboard"],
+            "detected": {"computer": 8, "chair": 3},
+            "views": [
+                {
+                    "view": view,
+                    "counts": {"computer": 2, "chair": 1},
+                    "detections": [{
+                        "class_name": "computer",
+                        "confidence": 0.91,
+                        "bbox": [1.0, 2.0, 3.0, 4.0],
+                    }],
+                }
+                for view in range(1, 5)
+            ],
+            "annotated_images": [annotated_image] * 4,
+        }
         original = self.db.get(sach.CentreRecord, "TEST_001")
         original_metrics = (
             original.detected_computers,
@@ -674,18 +1009,29 @@ class ApiBehaviorTests(unittest.TestCase):
             original.status,
         )
 
-        response = sach.run_infrastructure_scan("TEST_001", request, self.db)
+        with patch.object(sach, "_run_dev2_inference", return_value=inference) as run_inference:
+            response = sach.run_infrastructure_scan("TEST_001", request, self.db)
+        run_inference.assert_called_once_with(
+            [image] * 4,
+            {"computer": 10, "chair": 5},
+        )
         audit = self.db.scalar(
             select(sach.AuditRecord).where(sach.AuditRecord.centre_id == "TEST_001")
         )
         evidence = sach.get_audit_evidence(audit.id, self.db)
         updated = self.db.get(sach.CentreRecord, "TEST_001")
 
-        self.assertEqual(response["detection_source"], "SIMULATED")
+        self.assertEqual(response["detection_source"], "DEV2_YOLO")
         self.assertFalse(response["authoritative_centre_metrics_updated"])
         self.assertEqual(response["views_captured"], 4)
-        self.assertEqual(audit.detection_source, "SIMULATED")
+        self.assertEqual(response["model"], "equipment_yolo11n_v2.pt")
+        self.assertEqual(response["detected"], {"computer": 8, "chair": 3})
+        self.assertEqual(response["classes"][0]["detected"], 8)
+        self.assertEqual(audit.detection_source, "DEV2_YOLO")
         self.assertEqual(evidence["images"], [image] * 4)
+        self.assertEqual(evidence["annotated_images"], [annotated_image] * 4)
+        self.assertEqual(evidence["results"]["model"], "equipment_yolo11n_v2.pt")
+        self.assertEqual(evidence["results"]["views"][0]["detections"][0]["confidence"], 0.91)
         self.assertEqual(
             (
                 updated.detected_computers,
@@ -700,6 +1046,44 @@ class ApiBehaviorTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:
             sach.get_audit_evidence(9999, self.db)
         self.assertEqual(raised.exception.status_code, 404)
+
+    def test_dev2_failure_does_not_store_a_fake_audit(self):
+        image = "data:image/jpeg;base64," + base64.b64encode(b"\xff\xd8\xffimage").decode()
+        request = sach.ScanSubmission(centre_id="TEST_001", base64_images=[image] * 4)
+        with patch.object(
+            sach,
+            "_run_dev2_inference",
+            side_effect=HTTPException(status_code=502, detail="Detector failed"),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                sach.run_infrastructure_scan("TEST_001", request, self.db)
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertIsNone(
+            self.db.scalar(
+                select(sach.AuditRecord).where(sach.AuditRecord.centre_id == "TEST_001")
+            )
+        )
+
+    def test_unsupported_dev2_classes_force_review_and_are_not_counted_as_zero(self):
+        image = "data:image/jpeg;base64," + base64.b64encode(b"\xff\xd8\xffimage").decode()
+        inference = {
+            "model": "equipment_yolo11n_v2.pt",
+            "device": "cpu",
+            "supported_classes": ["computer"],
+            "detected": {"computer": 10},
+            "views": [{"view": index, "counts": {}, "detections": []} for index in range(1, 5)],
+            "annotated_images": ["data:image/jpeg;base64,annotated"] * 4,
+        }
+        with patch.object(sach, "_run_dev2_inference", return_value=inference):
+            response = sach.run_infrastructure_scan(
+                "TEST_001",
+                sach.ScanSubmission(centre_id="TEST_001", base64_images=[image] * 4),
+                self.db,
+            )
+        chair_result = next(item for item in response["classes"] if item["name"] == "chair")
+        self.assertIsNone(chair_result["detected"])
+        self.assertEqual(response["unsupported_classes"], ["chair"])
+        self.assertEqual(response["status"], "REVIEW")
 
     def test_admin_can_archive_and_restore_scan_record_without_deleting_evidence(self):
         audit = sach.AuditRecord(

@@ -13,7 +13,7 @@
 
 SACH brings centre attendance workflows, infrastructure audit records, alerts, and review tools into one web application. It is designed to help authorized officials compare submitted information with available telemetry, investigate discrepancies, and preserve a traceable review process.
 
-> **Prototype notice:** This repository is a working prototype, not a production government service. It does not currently connect to a live CCTV/face-recognition engine or course-tagged camera feeds. Risk indicators are review signals, not findings of fraud.
+> **Prototype notice:** This repository is a working prototype, not a production government service. Live camera feeds require a separately started AI producer and a configured camera source. Dev1 reports centre-wide person counts; its local face matching is not linked to enrolled roster profiles or course attendance. Risk indicators are review signals, not findings of fraud.
 
 ## At a glance
 
@@ -114,6 +114,18 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 Open the API documentation at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
+#### Dev2 infrastructure detector
+
+Infrastructure scans run Dev2's `inference_cli.py` in a subprocess so the Dev3 API can stay separate from the YOLO/PyTorch environment. By default, Dev3 expects the sibling `dev2` folder, its `.venv` Python interpreter, and `models/equipment_yolo11n_v2.pt`. If Dev2 is stored elsewhere, set `SACH_DEV2_ROOT` and `SACH_DEV2_PYTHON` in the backend environment before starting Uvicorn. A scan stores the original images, model-annotated images, per-view detections, confidence scores, and model/device metadata; unsupported centre equipment classes are explicitly excluded and force review.
+
+#### Live camera producers
+
+Start Dev1 first; it owns the configured camera and sends its centre-tagged attendance frames. Dev2 does not open another camera: it authenticates to that same centre's attendance WebSocket, runs its equipment detector on those frames, and publishes annotated visual proof to the matching infrastructure feed. Set `SACH_CENTRE_ID` to the same centre in both processes (or select the same centre interactively). Dev1 sends UTC attendance samples every two seconds. Dev2 sends transient telemetry to `/api/audit/live`; this does not create audit-history records or overwrite evidence-backed scan results. The server calculates live computer compliance from that centre's current equipment configuration.
+
+Dev1 accepts `SACH_CAMERA_SOURCE` (an OpenCV device index such as `0`, or a camera URL), `SACH_CAMERA_ID` (a non-secret source identifier), and `SACH_CAMERA_LABEL`. Both producers use `SACH_BACKEND_URL` to select Dev3's API and the same authorized credentials to connect. Never put credentials in a camera URL that is sent to the UI. Browser WebSocket clients and camera producers authenticate with their existing bearer session in the initial WebSocket message; tokens are not placed in the URL. The backend rejects Dev2 frames unless they identify the same attendance source centre and camera.
+
+The Monitoring and Infrastructure pages share the selected centre. Infrastructure visual proof is Dev2's equipment-annotated result generated from that centre's Dev1 frame; both display the source camera identifier. The monitoring page does not offer a classroom selector because no classroom-to-camera mapping exists yet. The displayed resolution comes from received frames; live FPS and bitrate are not claimed. Course/roster identity matching still requires an approved face-profile enrollment and camera mapping and is not represented as completed.
+
 ### 3. Set up the frontend
 
 In a second terminal, from the repository root:
@@ -134,7 +146,7 @@ Open the local Vite URL printed in the terminal (normally [http://127.0.0.1:5173
 4. Sign in with the provisioned Operator account to submit and manage that centre's daily register.
 5. Use **Centre Registers** as an Admin or Auditor to review submissions and handle override requests.
 
-The seeded sample centres are not evidence of live camera telemetry. Course-level camera verification remains unavailable until a verified course-level feed is integrated.
+The seeded sample centres are not evidence of live camera telemetry. The WebSocket relay displays frames only when a camera producer is running for that centre; a centre with no recent producer is shown as waiting or stale. Course-level camera verification remains unavailable until a verified course-level feed is integrated.
 
 ## Role and security boundaries
 
@@ -188,8 +200,9 @@ The lint command may report existing warnings; resolve new errors introduced by 
 
 ## Current prototype boundaries
 
-- No live CCTV ingestion, face matching, or verified course-level camera feed is included.
-- Infrastructure scan records and attendance telemetry should be treated according to their configured data source; simulated or unavailable values are not live evidence.
+- Attendance and infrastructure WebSocket relay endpoints are included, but no physical CCTV source is bundled; run a camera producer for each centre that needs a live feed.
+- New infrastructure audits use Dev2 YOLO. Historical records marked `SIMULATED`, and any unavailable/stale live feed, are not live evidence.
+- Face matching and verified course-level camera feeds are not included.
 - SQLite is suitable for local development and demonstrations, not a multi-instance production deployment.
 - Production use needs deployment-grade secret management, HTTPS, database operations and backups, monitoring, privacy/biometric governance, and security review.
 

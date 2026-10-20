@@ -36,7 +36,6 @@ import {
   Upload,
   Trash2,
   Plus,
-  ChevronRight,
   ShieldCheck,
   SlidersHorizontal,
   Database,
@@ -49,6 +48,52 @@ import {
 
 const API_BASE = 'http://127.0.0.1:8000/api';
 const AUTH_TOKEN_KEY = 'sach_access_token';
+const SHARED_CENTRE_KEY = 'sach_selected_centre';
+
+function useSharedCentre(initialCentre) {
+  const [selectedCentre, setSelectedCentre] = useState(
+    () => window.localStorage.getItem(SHARED_CENTRE_KEY) || initialCentre
+  );
+
+  useEffect(() => {
+    const syncCentre = event => {
+      const centreId = event.type === 'storage'
+        ? event.newValue
+        : event.detail;
+      if (centreId) setSelectedCentre(centreId);
+    };
+    window.addEventListener('storage', syncCentre);
+    window.addEventListener('sach-centre-selection', syncCentre);
+    return () => {
+      window.removeEventListener('storage', syncCentre);
+      window.removeEventListener('sach-centre-selection', syncCentre);
+    };
+  }, []);
+
+  const selectCentre = centreId => {
+    setSelectedCentre(centreId);
+    window.localStorage.setItem(SHARED_CENTRE_KEY, centreId);
+    window.dispatchEvent(new CustomEvent('sach-centre-selection', {
+      detail: centreId
+    }));
+  };
+
+  return [selectedCentre, selectCentre];
+}
+
+const openAuthenticatedWebSocket = url => {
+  const socket = new WebSocket(url);
+  socket.addEventListener('open', () => {
+    const token = sessionStorage.getItem(AUTH_TOKEN_KEY);
+    if (!token) {
+      console.error('Cannot open live feed without an authenticated session.');
+      socket.close();
+      return;
+    }
+    socket.send(JSON.stringify({ type: 'auth', token }));
+  });
+  return socket;
+};
 
 const getDefaultPreviewRole = role => {
   if (role === 'ADMIN') return 'ADMIN';
@@ -392,7 +437,40 @@ export default function App() {
     setMobileMenuOpen(false);
   };
 
-  const allCentres = Object.entries(stats?.centres || {});
+  const dashboardNow = Date.now();
+  const allCentres = Object.entries(stats?.centres || {}).map(([centreId, centre]) => {
+    const liveInfrastructure = stats?.live_infrastructure?.[centreId];
+    const liveInfrastructureAge = liveInfrastructure?.received_at
+      ? (dashboardNow - Date.parse(liveInfrastructure.received_at)) / 1000
+      : null;
+    const hasFreshInfrastructure = Number.isFinite(liveInfrastructureAge)
+      && liveInfrastructureAge >= -5
+      && liveInfrastructureAge <= 10;
+    const attendanceAge = centre?.last_attendance_at
+      ? (dashboardNow - Date.parse(centre.last_attendance_at)) / 1000
+      : null;
+
+    return [centreId, {
+      ...centre,
+      ...(hasFreshInfrastructure ? {
+        detected_computers: liveInfrastructure.detected_computers,
+        required_computers: liveInfrastructure.required_computers,
+        compliance_percentage: liveInfrastructure.compliance_percentage,
+        live_infrastructure_status: liveInfrastructure.status
+      } : {}),
+      live_infrastructure_received_at: liveInfrastructure?.received_at || null,
+      live_infrastructure_age_seconds: Number.isFinite(liveInfrastructureAge)
+        ? Math.max(0, Math.floor(liveInfrastructureAge))
+        : null,
+      live_infrastructure_fresh: hasFreshInfrastructure,
+      live_attendance_age_seconds: Number.isFinite(attendanceAge)
+        ? Math.max(0, Math.floor(attendanceAge))
+        : null,
+      live_attendance_fresh: Number.isFinite(attendanceAge)
+        && attendanceAge >= -5
+        && attendanceAge <= 10
+    }];
+  });
 
   const totalCentres = allCentres.length;
 
@@ -2413,30 +2491,26 @@ function DashboardPage({
           icon={<HardDrive size={18} />}
           label="Infrastructure"
           value={`${averageCompliance}%`}
-          sub="Average compliance"
+          sub={`${allCentres.filter(([, centre]) => centre?.live_infrastructure_fresh).length} / ${totalCentres} centres updated within 10s`}
         />
         <MetricCard
           icon={<Users size={18} />}
           label="Officially Marked Present"
-          value={overview?.summary?.total_officially_present ?? '—'}
+          value={totalMarkedPresent}
           sub="Reported attendance count"
         />
 
         <MetricCard
           icon={<Activity size={18} />}
           label="AI Camera Count"
-          value={overview?.summary?.total_live_headcount ?? '—'}
-          sub="People detected by monitoring"
+          value={totalDetected}
+          sub={`${allCentres.filter(([, centre]) => centre?.live_attendance_fresh).length} / ${totalCentres} centres updated within 10s`}
         />
 
         <MetricCard
           icon={<ShieldAlert size={18} />}
           label="Missing / Discrepancy Gap"
-          value={
-            overview?.summary
-              ? overview.summary.total_attendance_gap ?? 0
-              : '—'
-          }
+          value={totalMissing}
           sub="Marked present minus AI camera count"
         />
 
@@ -2563,12 +2637,26 @@ function DashboardPage({
 
                         <td style={styles.td}>
                           {attendance}%
+                          <div style={styles.miniText}>
+                            {info?.live_attendance_fresh
+                              ? `Live · ${info.live_attendance_age_seconds}s ago`
+                              : info?.last_attendance_at
+                                ? `Last camera sample · ${info.live_attendance_age_seconds ?? '—'}s ago`
+                                : 'No camera sample'}
+                          </div>
                         </td>
 
                         <td style={styles.td}>
                           {info?.compliance_percentage ??
                             0}
                           %
+                          <div style={styles.miniText}>
+                            {info?.live_infrastructure_fresh
+                              ? `Live · ${info.live_infrastructure_age_seconds}s ago`
+                              : info?.live_infrastructure_received_at
+                                ? `Last live result · ${info.live_infrastructure_age_seconds ?? '—'}s ago`
+                                : 'Saved audit result'}
+                          </div>
                         </td>
 
                         <td style={styles.td}>
@@ -2794,6 +2882,13 @@ function DashboardPage({
                       {' / '}
                       {info?.official_marked_present ?? 0}
                     </strong>
+                    <span style={styles.miniText}>
+                      {info?.live_attendance_fresh
+                        ? `Live · ${info.live_attendance_age_seconds}s ago`
+                        : info?.last_attendance_at
+                          ? `Last sample · ${info.live_attendance_age_seconds ?? '—'}s ago`
+                          : 'No camera sample'}
+                    </span>
                   </div>
 
                   <div
@@ -2808,6 +2903,13 @@ function DashboardPage({
                         0}
                       %
                     </strong>
+                    <span style={styles.miniText}>
+                      {info?.live_infrastructure_fresh
+                        ? `Live · ${info.live_infrastructure_status} · ${info.live_infrastructure_age_seconds}s ago`
+                        : info?.live_infrastructure_received_at
+                          ? `Last live result · ${info.live_infrastructure_age_seconds ?? '—'}s ago`
+                          : 'Saved audit result'}
+                    </span>
                   </div>
 
                   <div
@@ -3660,38 +3762,110 @@ function MonitoringPage({
   fetchStats,
   canSubmitAttendance
 }) {
-  const [selectedMonitorCentre, setSelectedMonitorCentre] = useState(
-    allCentres[0]?.[0] || 'DELHI_001'
-  );
-  const [cameraRoom, setCameraRoom] = useState('CAM-01 (Main Classroom)');
+  const [selectedMonitorCentre, setSelectedMonitorCentre] = useSharedCentre('');
   const [isUpdating, setIsUpdating] = useState(false);
-  const [streamTime, setStreamTime] = useState(new Date().toLocaleTimeString());
+  const [streamTime, setStreamTime] = useState('--:--:--');
+  const [clockTimeMs, setClockTimeMs] = useState(0);
+  const [streamFramesByCentre, setStreamFramesByCentre] = useState({});
+  const [streamHeadcountsByCentre, setStreamHeadcountsByCentre] = useState({});
+  const [streamConnection, setStreamConnection] = useState('SELECT A CENTRE');
 
   useEffect(() => {
     const timer = setInterval(() => {
-      setStreamTime(new Date().toLocaleTimeString());
+      const now = new Date();
+      setStreamTime(now.toLocaleTimeString());
+      setClockTimeMs(now.getTime());
     }, 1000);
     return () => clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    if (!selectedMonitorCentre) return undefined;
+    const wsBase = API_BASE.replace(/\/api\/?$/, '').replace(/^http/, 'ws');
+    const socket = openAuthenticatedWebSocket(
+      `${wsBase}/ws/live_feed/${encodeURIComponent(selectedMonitorCentre)}/attendance`
+    );
+
+    socket.onopen = () => setStreamConnection('CONNECTED · WAITING FOR CAMERA');
+    socket.onmessage = event => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'authenticated') return;
+        if (typeof message.frame === 'string') {
+          setStreamFramesByCentre(current => ({
+            ...current,
+            [selectedMonitorCentre]: message
+          }));
+          setStreamConnection('LIVE');
+        }
+        if (Number.isInteger(message.live_headcount) && message.live_headcount >= 0) {
+          setStreamHeadcountsByCentre(current => ({
+            ...current,
+            [selectedMonitorCentre]: message.live_headcount
+          }));
+        }
+      } catch (error) {
+        console.error('Invalid live-feed WebSocket message:', error);
+      }
+    };
+
+    socket.onerror = error => {
+      setStreamConnection('CONNECTION ERROR');
+      console.error('Live-feed WebSocket error:', error);
+    };
+    socket.onclose = () => setStreamConnection('DISCONNECTED');
+
+    return () => {
+      socket.onmessage = null;
+      socket.onopen = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.close();
+    };
+  }, [selectedMonitorCentre]);
+
   const logs = stats?.recent_attendance_logs || [];
 
   const currentInfo =
-    allCentres.find(([id]) => id === selectedMonitorCentre)?.[1] ||
-    allCentres[0]?.[1] ||
-    {};
+    allCentres.find(([id]) => id === selectedMonitorCentre)?.[1] || {};
 
-  const headcount = Number(currentInfo?.live_headcount || 0);
+  const streamFrame = streamFramesByCentre[selectedMonitorCentre]?.frame || '';
+  const selectedStreamFrame = streamFramesByCentre[selectedMonitorCentre];
+  const streamReceivedAt = selectedStreamFrame?.received_at;
+  const frameResolution = Number.isInteger(selectedStreamFrame?.frame_width)
+    && Number.isInteger(selectedStreamFrame?.frame_height)
+    ? `${selectedStreamFrame.frame_width} × ${selectedStreamFrame.frame_height}`
+    : 'Waiting for frame';
   const markedPresent = Number(currentInfo?.official_marked_present ?? 0);
   const risk = Number(currentInfo?.fraud_risk_score || 0);
   const attendanceRisk = Number(currentInfo?.attendance_risk_score ?? 0);
   const infraRisk = Number(currentInfo?.infra_risk_score ?? 0);
+  const calculatedFrameAge = streamReceivedAt && clockTimeMs
+    ? (clockTimeMs - Date.parse(streamReceivedAt)) / 1000
+    : null;
+  const frameAgeSeconds = Number.isFinite(calculatedFrameAge) && calculatedFrameAge >= 0
+    ? Math.floor(calculatedFrameAge)
+    : null;
+  const headcount = frameAgeSeconds !== null && frameAgeSeconds <= 10
+    ? streamHeadcountsByCentre[selectedMonitorCentre] ?? null
+    : null;
   const isAnomaly =
     headcount === 0 &&
     markedPresent > 0 &&
     Boolean(currentInfo?.attendance_gap_active);
+  const streamStatus = frameAgeSeconds === null
+    ? streamConnection
+    : frameAgeSeconds > 10
+      ? 'STALE · NO RECENT CAMERA FRAMES'
+      : 'LIVE';
+
+  const selectMonitorCentre = centreId => {
+    setSelectedMonitorCentre(centreId);
+    setStreamConnection(centreId ? 'CONNECTING' : 'SELECT A CENTRE');
+  };
 
   const handleUpdateHeadcount = async (newCount) => {
+    if (!selectedMonitorCentre) return;
     setIsUpdating(true);
     try {
       await axios.post(`${API_BASE}/attendance/log`, {
@@ -3699,6 +3873,10 @@ function MonitoringPage({
         live_headcount: Math.max(0, newCount),
         timestamp: new Date().toISOString()
       });
+      setStreamHeadcountsByCentre(current => ({
+        ...current,
+        [selectedMonitorCentre]: Math.max(0, newCount)
+      }));
       if (fetchStats) await fetchStats();
     } catch (e) {
       console.error('Failed to log attendance update:', e);
@@ -3707,28 +3885,12 @@ function MonitoringPage({
     }
   };
 
-  const boxPositions = [
-    { top: '36%', left: '14%', w: '85px', h: '110px', conf: 96 },
-    { top: '34%', left: '32%', w: '82px', h: '108px', conf: 94 },
-    { top: '35%', left: '50%', w: '84px', h: '112px', conf: 97 },
-    { top: '33%', left: '68%', w: '80px', h: '106px', conf: 95 },
-    { top: '56%', left: '10%', w: '105px', h: '135px', conf: 98 },
-    { top: '54%', left: '28%', w: '100px', h: '130px', conf: 92 },
-    { top: '55%', left: '48%', w: '106px', h: '138px', conf: 96 },
-    { top: '53%', left: '68%', w: '102px', h: '134px', conf: 94 },
-    { top: '58%', left: '84%', w: '92px', h: '125px', conf: 91 },
-    { top: '24%', left: '20%', w: '60px', h: '80px', conf: 89 },
-    { top: '25%', left: '40%', w: '62px', h: '82px', conf: 90 },
-    { top: '23%', left: '60%', w: '58px', h: '78px', conf: 93 },
-    { top: '22%', left: '76%', w: '56px', h: '75px', conf: 88 }
-  ];
-
   return (
     <div>
 
       <PageIntro
         title="Live Stream Monitoring"
-        description="Continuous AI observation stream from connected training centre cameras."
+        description="Centre-wide person counts from the configured Dev1 camera. Course and roster identity verification are not connected."
         badge="LIVE CCTV"
       />
 
@@ -3754,7 +3916,7 @@ function MonitoringPage({
               display: 'inline-flex',
               alignItems: 'center',
               gap: '6px',
-              background: '#dc2626',
+              background: streamStatus === 'LIVE' ? '#dc2626' : '#b45309',
               color: '#ffffff',
               padding: '3px 8px',
               borderRadius: '4px',
@@ -3762,12 +3924,13 @@ function MonitoringPage({
               fontWeight: '700',
               letterSpacing: '0.5px'
             }}>
-              <Radio size={12} className="animate-pulse" /> LIVE STREAM
+              <Radio size={12} className={streamStatus === 'LIVE' ? 'animate-pulse' : ''} />
+              {streamStatus}
             </div>
 
             <select
               value={selectedMonitorCentre}
-              onChange={e => setSelectedMonitorCentre(e.target.value)}
+              onChange={e => selectMonitorCentre(e.target.value)}
               style={{
                 background: '#1e293b',
                 color: '#ffffff',
@@ -3778,6 +3941,7 @@ function MonitoringPage({
                 fontWeight: '600'
               }}
             >
+              <option value="" disabled>Select a centre CCTV feed…</option>
               {allCentres.map(([id, info]) => (
                 <option key={id} value={id}>
                   {info?.name || id} ({id})
@@ -3785,28 +3949,12 @@ function MonitoringPage({
               ))}
             </select>
 
-            <select
-              value={cameraRoom}
-              onChange={e => setCameraRoom(e.target.value)}
-              style={{
-                background: '#1e293b',
-                color: '#94a3b8',
-                border: '1px solid #334155',
-                padding: '6px 10px',
-                borderRadius: '6px',
-                fontSize: '12px'
-              }}
-            >
-              <option value="CAM-01 (Main Classroom)">CAM-01 (Main Classroom)</option>
-              <option value="CAM-02 (Computer Lab)">CAM-02 (Computer Lab)</option>
-            </select>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '16px', fontSize: '11px', color: '#94a3b8' }}>
-            <span>FPS: <strong style={{ color: '#4ade80' }}>24.2</strong></span>
-            <span>Bitrate: <strong style={{ color: '#38bdf8' }}>4.8 Mbps</strong></span>
-            <span>Res: <strong style={{ color: '#ffffff' }}>1080p</strong></span>
-            <span>Engine: <strong style={{ color: '#f59e0b' }}>YOLOv8x Person</strong></span>
+            <span>Source: <strong style={{ color: '#ffffff' }}>{selectedStreamFrame?.camera_label || 'Dev1 configured camera'}</strong></span>
+            <span>Frame resolution: <strong style={{ color: '#ffffff' }}>{frameResolution}</strong></span>
+            <span>Count: <strong style={{ color: '#4ade80' }}>{headcount ?? '—'}</strong></span>
           </div>
         </div>
 
@@ -3844,6 +3992,34 @@ function MonitoringPage({
             pointerEvents: 'none'
           }} />
 
+          {streamFrame ? (
+            <img
+              src={`data:image/jpeg;base64,${streamFrame}`}
+              alt={`Live AI feed for ${selectedMonitorCentre}`}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                width: '100%',
+                height: '100%',
+                objectFit: 'contain',
+                zIndex: 1
+              }}
+            />
+          ) : (
+            <div style={{
+              position: 'absolute',
+              inset: 0,
+              display: 'grid',
+              placeItems: 'center',
+              color: '#94a3b8',
+              fontSize: '14px'
+            }}>
+              {selectedMonitorCentre
+                ? `Waiting for the ${selectedMonitorCentre} attendance stream…`
+                : 'Select a centre above to view its CCTV attendance feed.'}
+            </div>
+          )}
+
           {/* Top HUD Overlay */}
           <div style={{
             position: 'relative',
@@ -3857,50 +4033,26 @@ function MonitoringPage({
             fontFamily: 'monospace'
           }}>
             <div>
-              <span style={{ color: '#ef4444', fontWeight: 'bold' }}>● REC </span>
-              {streamTime} | {cameraRoom}
+              <span style={{
+                color: streamStatus === 'LIVE' ? '#ef4444' : '#94a3b8',
+                fontWeight: 'bold'
+              }}>
+                ● {streamStatus === 'LIVE' ? 'REC' : streamStatus}
+              </span>
+              {streamTime} | {frameResolution}
             </div>
             <div style={{ background: 'rgba(0,0,0,0.6)', padding: '4px 10px', borderRadius: '4px', border: '1px solid rgba(255,255,255,0.1)' }}>
-              FEED: <span style={{ color: '#38bdf8' }}>{selectedMonitorCentre}</span>
+              CENTRE: <span style={{ color: '#38bdf8' }}>{selectedMonitorCentre || 'Not selected'}</span>
+              {streamReceivedAt && (
+                <span style={{ marginLeft: '10px' }}>
+                  FRAME AGE: {frameAgeSeconds}s
+                </span>
+              )}
             </div>
           </div>
 
-          {/* Dynamic YOLO Bounding Boxes */}
+          {/* Live-feed alert overlay */}
           <div style={{ position: 'absolute', inset: 0, zIndex: 5, pointerEvents: 'none' }}>
-            {headcount > 0 ? (
-              boxPositions.slice(0, Math.min(headcount, boxPositions.length)).map((pos, idx) => (
-                <div
-                  key={idx}
-                  style={{
-                    position: 'absolute',
-                    top: pos.top,
-                    left: pos.left,
-                    width: pos.w,
-                    height: pos.h,
-                    border: '2px solid #22c55e',
-                    borderRadius: '4px',
-                    boxShadow: '0 0 10px rgba(34, 197, 94, 0.35)',
-                    transition: 'all 0.5s ease'
-                  }}
-                >
-                  <div style={{
-                    position: 'absolute',
-                    top: '-18px',
-                    left: '-2px',
-                    background: '#22c55e',
-                    color: '#000000',
-                    fontSize: '9px',
-                    fontWeight: '800',
-                    padding: '1px 5px',
-                    borderRadius: '2px',
-                    whiteSpace: 'nowrap'
-                  }}>
-                    Person #{idx + 1} {pos.conf}%
-                  </div>
-                </div>
-              ))
-            ) : null}
-
             {/* Zero Headcount Anomaly Banner */}
             {isAnomaly && (
               <div style={{
@@ -3946,8 +4098,8 @@ function MonitoringPage({
           }}>
             <div style={{ display: 'flex', gap: '20px' }}>
               <span>Marked Present: <strong>{markedPresent}</strong></span>
-              <span>AI Camera Count: <strong style={{ color: headcount > 0 ? '#4ade80' : '#f87171' }}>{headcount}</strong></span>
-              <span>Missing / Discrepancy Gap: <strong style={{ color: (markedPresent - headcount) > 5 ? '#f87171' : '#f59e0b' }}>{Math.max(0, markedPresent - headcount)}</strong></span>
+              <span>AI Camera Count: <strong style={{ color: headcount === null ? '#94a3b8' : headcount > 0 ? '#4ade80' : '#f87171' }}>{headcount ?? '—'}</strong></span>
+              <span>Missing / Discrepancy Gap: <strong style={{ color: headcount !== null && (markedPresent - headcount) > 5 ? '#f87171' : '#f59e0b' }}>{headcount === null ? '—' : Math.max(0, markedPresent - headcount)}</strong></span>
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
@@ -3984,31 +4136,31 @@ function MonitoringPage({
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
             <span style={{ fontSize: '12px', fontWeight: '600', color: '#475569' }}>
-              Live Telemetry Control:
+              Manual Test Telemetry (not a camera feed):
             </span>
             <button
-              disabled={isUpdating || !canSubmitAttendance}
+              disabled={isUpdating || !canSubmitAttendance || !selectedMonitorCentre || headcount === null}
               style={{ ...styles.smallActionButton, background: '#eff6ff', color: '#1e40af' }}
               onClick={() => handleUpdateHeadcount(headcount + 1)}
             >
               +1 Student Enter
             </button>
             <button
-              disabled={isUpdating || !canSubmitAttendance}
+              disabled={isUpdating || !canSubmitAttendance || !selectedMonitorCentre || headcount === null}
               style={{ ...styles.smallActionButton, background: '#eff6ff', color: '#1e40af' }}
               onClick={() => handleUpdateHeadcount(headcount - 1)}
             >
               -1 Student Exit
             </button>
             <button
-              disabled={isUpdating || !canSubmitAttendance}
+              disabled={isUpdating || !canSubmitAttendance || !selectedMonitorCentre}
               style={{ ...styles.smallActionButton, background: '#fef2f2', color: '#991b1b', borderColor: '#fecaca' }}
               onClick={() => handleUpdateHeadcount(0)}
             >
               Set 0 Present (Ghost Batch)
             </button>
             <button
-              disabled={isUpdating || !canSubmitAttendance}
+              disabled={isUpdating || !canSubmitAttendance || !selectedMonitorCentre}
               style={{ ...styles.smallActionButton, background: '#f0fdf4', color: '#166534', borderColor: '#bbf7d0' }}
               onClick={() => handleUpdateHeadcount(markedPresent)}
             >
@@ -4032,7 +4184,7 @@ function MonitoringPage({
 
           <SectionHeader
             title="Connected Monitoring Hubs"
-            subtitle="Current centre telemetry"
+            subtitle="Select a centre to request its attendance feed; status reflects received frames"
           />
 
           <div
@@ -4045,6 +4197,15 @@ function MonitoringPage({
                 const risk = Number(
                   info?.fraud_risk_score || 0
                 );
+                const centreFrameAt = streamFramesByCentre[id]?.received_at;
+                const centreFrameAge = centreFrameAt && clockTimeMs
+                  ? Math.max(0, Math.floor(
+                    (clockTimeMs - new Date(centreFrameAt).getTime()) / 1000
+                  ))
+                  : null;
+                const centreFeedStatus = centreFrameAge === null
+                  ? 'NO FEED'
+                  : centreFrameAge > 15 ? 'STALE' : 'FEED LIVE';
 
                 return (
                   <div
@@ -4054,7 +4215,16 @@ function MonitoringPage({
                       cursor: 'pointer',
                       border: id === selectedMonitorCentre ? '2px solid #2563eb' : styles.monitorCentreCard.border
                     }}
-                    onClick={() => setSelectedMonitorCentre(id)}
+                    onClick={() => selectMonitorCentre(id)}
+                    onKeyDown={event => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        selectMonitorCentre(id);
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={id === selectedMonitorCentre}
                   >
 
                     <div
@@ -4089,11 +4259,14 @@ function MonitoringPage({
 
                       <span
                         style={
-                          styles.connectedBadge
+                          {
+                            ...styles.connectedBadge,
+                            color: centreFeedStatus === 'FEED LIVE' ? '#15803d' : '#b45309'
+                          }
                         }
                       >
                         <Radio size={10} />
-                        ONLINE
+                        {centreFeedStatus}
                       </span>
 
                     </div>
@@ -4518,16 +4691,99 @@ function CentresPage({
 
 function AttendancePage({
   allCentres,
-  totalMarkedPresent,
-  totalDetected,
-  totalMissing,
-  attendanceRate,
   getRiskStyle,
-  getRiskColor,
   stats
 }) {
+  const [liveAttendance, setLiveAttendance] = useState({});
+  const [liveNow, setLiveNow] = useState(0);
+  const liveAttendanceRef = useRef({});
+  const lastUiUpdateByCentre = useRef({});
+  const centreIds = allCentres.map(([id]) => id).join('|');
   const logs =
     stats?.recent_attendance_logs || [];
+
+  useEffect(() => {
+    const timer = setInterval(() => setLiveNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!centreIds) return undefined;
+
+    const wsBase = API_BASE.replace(/\/api\/?$/, '').replace(/^http/, 'ws');
+    const sockets = centreIds.split('|').map(centreId => {
+      const socket = openAuthenticatedWebSocket(
+        `${wsBase}/ws/live_feed/${encodeURIComponent(centreId)}/attendance`
+      );
+      socket.onmessage = event => {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === 'authenticated') return;
+          if (!Number.isInteger(message.live_headcount) || message.live_headcount < 0) {
+            return;
+          }
+          const receivedAt = message.received_at || new Date().toISOString();
+          const now = Date.now();
+          const previous = liveAttendanceRef.current[centreId];
+          if (
+            previous?.count !== message.live_headcount ||
+            now - (lastUiUpdateByCentre.current[centreId] || 0) >= 1000
+          ) {
+            lastUiUpdateByCentre.current[centreId] = now;
+            liveAttendanceRef.current[centreId] = {
+              count: message.live_headcount,
+              receivedAt
+            };
+            setLiveAttendance(current => ({
+              ...current,
+              [centreId]: {
+                count: message.live_headcount,
+                receivedAt
+              }
+            }));
+          }
+        } catch (error) {
+          console.error(`Invalid attendance feed for ${centreId}:`, error);
+        }
+      };
+      socket.onerror = error => {
+        console.error(`Attendance feed connection failed for ${centreId}:`, error);
+      };
+      return socket;
+    });
+
+    return () => sockets.forEach(socket => {
+      socket.onmessage = null;
+      socket.onerror = null;
+      socket.close();
+    });
+  }, [centreIds]);
+
+  const getFreshCount = centreId => {
+    const sample = liveAttendance[centreId];
+    if (!sample || !liveNow) return null;
+    const age = liveNow - Date.parse(sample.receivedAt);
+    return age >= 0 && age <= 10000 ? sample.count : null;
+  };
+  const monitoredCentres = allCentres.filter(([id]) => getFreshCount(id) !== null);
+  const totalDetected = monitoredCentres.reduce(
+    (total, [id]) => total + getFreshCount(id),
+    0
+  );
+  const totalMarkedPresent = monitoredCentres.reduce(
+    (total, [, info]) => total + Number(info?.official_marked_present ?? 0),
+    0
+  );
+  const totalMissing = monitoredCentres.reduce(
+    (total, [id, info]) => total + Math.max(
+      0,
+      Number(info?.official_marked_present ?? 0) - getFreshCount(id)
+    ),
+    0
+  );
+  const attendanceRate = totalMarkedPresent
+    ? Math.round(totalDetected / totalMarkedPresent * 100)
+    : 0;
 
   return (
     <div>
@@ -4547,20 +4803,20 @@ function AttendancePage({
           icon={<Users size={18} />}
           label="Officially Marked Present"
           value={totalMarkedPresent}
-          sub="Attendance reported by the centre"
+          sub={`Across ${monitoredCentres.length} centres with a fresh camera feed`}
         />
 
         <MetricCard
           icon={<UserCheck size={18} />}
           label="AI Camera Count"
-          value={totalDetected}
-          sub="Persons currently detected by camera"
+          value={monitoredCentres.length ? totalDetected : '—'}
+          sub="Live WebSocket detections; feeds expire after 10 seconds"
         />
 
         <MetricCard
           icon={<UserX size={18} />}
           label="Missing / Discrepancy Gap"
-          value={totalMissing}
+          value={monitoredCentres.length ? totalMissing : '—'}
           sub="Marked present minus AI camera count"
           danger={totalMissing > 0}
         />
@@ -4568,7 +4824,7 @@ function AttendancePage({
         <MetricCard
           icon={<Activity size={18} />}
           label="Attendance Coverage"
-          value={`${attendanceRate}%`}
+          value={monitoredCentres.length ? `${attendanceRate}%` : '—'}
           sub="AI camera count vs official marked present"
         />
 
@@ -4583,7 +4839,7 @@ function AttendancePage({
 
         <SectionHeader
           title="Centre Attendance Comparison"
-          subtitle="AI Camera Count vs Official Marked Present; enrolled students marked absent are excluded."
+          subtitle="Counts are read from live camera frames. Centres without a frame in the last 10 seconds show no live feed."
         />
 
         <div style={styles.tableScroll}>
@@ -4627,21 +4883,17 @@ function AttendancePage({
 
                   const official = Number(info?.official_marked_present ?? 0);
 
-                  const detected =
-                    Number(
-                      info?.live_headcount ||
-                        0
-                    );
+                  const detected = getFreshCount(id);
 
                   const difference =
-                    Math.max(
+                    detected === null ? null : Math.max(
                       official -
                         detected,
                       0
                     );
 
                   const percentage =
-                    official > 0
+                    detected !== null && official > 0
                       ? Math.round(
                           (detected /
                             official) *
@@ -4684,7 +4936,18 @@ function AttendancePage({
                       </td>
 
                       <td style={styles.td}>
-                        {detected}
+                        {detected === null ? (
+                          <span style={styles.tagWarning}>NO LIVE FEED</span>
+                        ) : (
+                          <>
+                            {detected}
+                            <div style={styles.miniText}>
+                              Updated {Math.floor(
+                                (liveNow - Date.parse(liveAttendance[id].receivedAt)) / 1000
+                              )}s ago
+                            </div>
+                          </>
+                        )}
                       </td>
 
                       <td
@@ -4692,12 +4955,14 @@ function AttendancePage({
                           ...styles.td,
                           fontWeight: '700',
                           color:
-                            difference > 0
+                            difference === null
+                              ? '#64748b'
+                              : difference > 0
                               ? '#b91c1c'
                               : '#15803d'
                         }}
                       >
-                        {difference}
+                        {difference ?? '—'}
                       </td>
 
                       <td style={styles.td}>
@@ -4735,7 +5000,7 @@ function AttendancePage({
                             styles.miniText
                           }
                         >
-                          {percentage}%
+                          {detected === null ? 'No feed' : `${percentage}%`}
                         </span>
 
                       </td>
@@ -4876,10 +5141,15 @@ function InfrastructurePage({
   const canScan = role === 'ADMIN' || role === 'AUDITOR';
   const canConfigure = role === 'ADMIN';
   const canViewEvidence = role === 'ADMIN' || role === 'AUDITOR';
-  const [selectedCentre, setSelectedCentre] =
-    useState(
-      allCentres[0]?.[0] || ''
-    );
+  const [selectedCentre, setSelectedCentre] = useSharedCentre(
+    allCentres[0]?.[0] || ''
+  );
+  const [liveInfraAudit, setLiveInfraAudit] = useState(null);
+  const [infraFrameData, setInfraFrameData] = useState('');
+  const [attendanceSource, setAttendanceSource] = useState(null);
+  const [attendanceSourceStatus, setAttendanceSourceStatus] = useState('CONNECTING');
+  const [infraConnection, setInfraConnection] = useState('CONNECTING');
+  const [infraNow, setInfraNow] = useState(0);
 
   const selectedInfo =
     allCentres.find(
@@ -4887,7 +5157,7 @@ function InfrastructurePage({
         id === selectedCentre
     )?.[1];
 
-  const compliance = Number(
+  const storedCompliance = Number(
     selectedInfo?.compliance_percentage ||
       0
   );
@@ -4915,6 +5185,150 @@ function InfrastructurePage({
     .filter(log => showArchivedAudits ? Boolean(log.archived_at) : !log.archived_at)
     .slice()
     .reverse();
+  const selectedLiveInfraAudit = liveInfraAudit?.centreId === selectedCentre
+    ? liveInfraAudit
+    : null;
+  const infraAgeSeconds = selectedLiveInfraAudit && infraNow
+    ? Math.floor((infraNow - Date.parse(selectedLiveInfraAudit.receivedAt)) / 1000)
+    : null;
+  const infraAgeLabelSeconds = infraAgeSeconds === null
+    ? null
+    : Math.max(0, infraAgeSeconds);
+  const liveInfraFresh = infraAgeSeconds !== null
+    && infraAgeSeconds >= -5
+    && infraAgeSeconds <= 10;
+  const attendanceSourceAgeSeconds = attendanceSource && infraNow
+    ? Math.floor((infraNow - Date.parse(attendanceSource.receivedAt)) / 1000)
+    : null;
+  const attendanceSourceAgeLabelSeconds = attendanceSourceAgeSeconds === null
+    ? null
+    : Math.max(0, attendanceSourceAgeSeconds);
+  const attendanceSourceFresh = attendanceSourceAgeSeconds !== null
+    && attendanceSourceAgeSeconds >= -5
+    && attendanceSourceAgeSeconds <= 10;
+  const compliance = liveInfraFresh
+    ? Number(selectedLiveInfraAudit.compliance)
+    : storedCompliance;
+
+  useEffect(() => {
+    const timer = setInterval(() => setInfraNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!selectedCentre) return undefined;
+    const wsBase = API_BASE.replace(/\/api\/?$/, '').replace(/^http/, 'ws');
+    const socket = openAuthenticatedWebSocket(
+      `${wsBase}/ws/live_feed/${encodeURIComponent(selectedCentre)}/infra`
+    );
+    setInfraFrameData('');
+    setLiveInfraAudit(null);
+    socket.onopen = () => setInfraConnection('WAITING FOR DEV2');
+    socket.onmessage = event => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'authenticated') return;
+        const sourceMatchesCentre = message.source_stream === 'attendance'
+          && message.source_centre_id === selectedCentre
+          && message.centre_id === selectedCentre
+          && typeof message.camera_id === 'string'
+          && message.camera_id.length > 0;
+        if (
+          typeof message.frame === 'string'
+          && message.frame.length > 0
+          && sourceMatchesCentre
+        ) setInfraFrameData(message.frame);
+        if (
+          !Number.isInteger(message.detected_computers)
+          || typeof message.status !== 'string'
+          || typeof message.received_at !== 'string'
+        ) {
+          return;
+        }
+        setLiveInfraAudit({
+          centreId: selectedCentre,
+          detected: message.detected_computers,
+          required: message.required_computers,
+          compliance: message.compliance_percentage,
+          status: message.status,
+          cameraId: message.camera_id,
+          sourceMatchesCentre,
+          receivedAt: message.received_at
+        });
+        setInfraConnection(
+          sourceMatchesCentre && typeof message.frame === 'string'
+            ? 'LIVE · SAME ATTENDANCE SOURCE'
+            : 'SOURCE MISMATCH'
+        );
+      } catch (error) {
+        console.error('Invalid Dev2 infrastructure stream message:', error);
+      }
+    };
+    socket.onerror = error => {
+      setInfraConnection('CONNECTION ERROR');
+      console.error('Dev2 infrastructure stream error:', error);
+    };
+    socket.onclose = () => setInfraConnection('DISCONNECTED');
+
+    return () => {
+      socket.onmessage = null;
+      socket.onopen = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.close();
+    };
+  }, [selectedCentre]);
+
+  useEffect(() => {
+    if (!selectedCentre) return undefined;
+    const wsBase = API_BASE.replace(/\/api\/?$/, '').replace(/^http/, 'ws');
+    const socket = openAuthenticatedWebSocket(
+      `${wsBase}/ws/live_feed/${encodeURIComponent(selectedCentre)}/attendance`
+    );
+    setAttendanceSource(null);
+    setAttendanceSourceStatus('CONNECTING');
+    socket.onmessage = event => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'authenticated') {
+          setAttendanceSourceStatus('CONNECTED · WAITING FOR FRAME');
+          return;
+        }
+        if (
+          message.centre_id !== selectedCentre
+          || message.stream_type !== 'attendance'
+          || typeof message.frame !== 'string'
+          || !message.frame
+          || typeof message.received_at !== 'string'
+        ) {
+          return;
+        }
+        const cameraId = typeof message.camera_id === 'string' && message.camera_id.trim()
+          ? message.camera_id
+          : `${selectedCentre}:camera-id-unreported`;
+        setAttendanceSource({
+          frame: message.frame,
+          cameraId,
+          receivedAt: message.received_at
+        });
+        setAttendanceSourceStatus('LIVE');
+      } catch (error) {
+        console.error('Invalid Dev1 attendance source frame:', error);
+      }
+    };
+    socket.onerror = error => {
+      setAttendanceSourceStatus('CONNECTION ERROR');
+      console.error('Dev1 attendance source stream error:', error);
+    };
+    socket.onclose = () => setAttendanceSourceStatus('DISCONNECTED');
+
+    return () => {
+      socket.onmessage = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.close();
+    };
+  }, [selectedCentre]);
 
   const setAuditArchived = async (auditId, archived) => {
     setArchiveError('');
@@ -5157,12 +5571,21 @@ function InfrastructurePage({
   };
 
   const viewAuditEvidence = async auditId => {
-    setEvidenceReview({ auditId, images: [], loading: true, error: '' });
+    setEvidenceReview({
+      auditId,
+      images: [],
+      annotatedImages: [],
+      results: null,
+      loading: true,
+      error: ''
+    });
     try {
       const { data } = await axios.get(`${API_BASE}/audits/${auditId}/evidence`);
       setEvidenceReview({
         auditId,
         images: data.images || [],
+        annotatedImages: data.annotated_images || [],
+        results: data.results || null,
         loading: false,
         error: ''
       });
@@ -5170,6 +5593,8 @@ function InfrastructurePage({
       setEvidenceReview({
         auditId,
         images: [],
+        annotatedImages: [],
+        results: null,
         loading: false,
         error: getApiErrorMessage(error, 'Could not load audit evidence.')
       });
@@ -5184,8 +5609,8 @@ function InfrastructurePage({
 
       <PageIntro
         title="Infrastructure Audit"
-        description="Capture infrastructure audit evidence and compare centre-specific equipment requirements. Counts remain simulated until the real detector is integrated."
-        badge="PROTOTYPE"
+        description="Analyze captured room evidence with Dev2's trained equipment detector. Each scan stores the source images, annotated detections, confidence scores, and model metadata."
+        badge="DEV2 YOLO"
       />
 
       <div style={styles.filterBar}>
@@ -5198,11 +5623,12 @@ function InfrastructurePage({
           <select
             value={selectedCentre}
             disabled={scanOpen}
-            onChange={e =>
-              setSelectedCentre(
-                e.target.value
-              )
-            }
+            onChange={e => {
+              setLiveInfraAudit(null);
+              setInfraFrameData('');
+              setInfraConnection('CONNECTING');
+              setSelectedCentre(e.target.value);
+            }}
             style={styles.select}
           >
 
@@ -5240,17 +5666,24 @@ function InfrastructurePage({
         <MetricCard
           icon={<HardDrive size={18} />}
           label="Compliance Score"
-          value={`${compliance}%`}
-          sub="Current infrastructure state"
+          value={liveInfraFresh ? `${compliance}%` : `${storedCompliance}%`}
+          sub={liveInfraFresh
+            ? `Live Dev2 result · updated ${infraAgeLabelSeconds}s ago`
+            : 'Last saved result; awaiting a fresh Dev2 camera frame'}
           danger={compliance < 70}
         />
 
 
         <MetricCard
           icon={<Cpu size={18} />}
-          label="Scan Engine"
-          value="MOCK"
-          sub="Image content is not analyzed"
+          label="Live Dev2 status"
+          value={liveInfraFresh
+            ? liveInfraAudit.status
+            : infraConnection.startsWith('LIVE') ? 'STALE' : infraConnection}
+          sub={liveInfraFresh
+            ? `${liveInfraAudit.detected}/${liveInfraAudit.required} computers · ${liveInfraAudit.compliance}% · updated ${infraAgeLabelSeconds}s ago`
+            : 'Waiting for fresh Dev2 camera detections (10s timeout)'}
+          danger={liveInfraFresh && liveInfraAudit.status !== 'COMPLIANT'}
         />
 
         <MetricCard
@@ -5276,58 +5709,72 @@ function InfrastructurePage({
         <div style={styles.tableCard}>
 
           <SectionHeader
-            title="Infrastructure Scan Evidence"
-            subtitle="Computer-vision scan source is identified per audit"
+            title="Dev2 Visual Proof · Shared Centre Camera"
+            subtitle={`Equipment detections are run on Dev1 attendance frames for ${selectedCentre}`}
           />
 
-          <div style={styles.scanPlaceholder}>
-
-            <div
-              style={
-                styles.scanPlaceholderIcon
-              }
-            >
-              <ScanLine size={30} />
+          <div style={{
+            ...styles.scanPlaceholder,
+            position: 'relative',
+            minHeight: '300px',
+            padding: 0,
+            overflow: 'hidden',
+            background: '#0f172a',
+            color: '#e2e8f0'
+          }}>
+            {infraFrameData && selectedLiveInfraAudit?.sourceMatchesCentre ? (
+              <img
+                src={`data:image/jpeg;base64,${infraFrameData}`}
+                alt={`Live Dev2 infrastructure detections for ${selectedCentre}`}
+                style={{
+                  width: '100%',
+                  height: '300px',
+                  objectFit: 'contain',
+                  display: 'block'
+                }}
+              />
+            ) : attendanceSourceFresh ? (
+              <img
+                src={`data:image/jpeg;base64,${attendanceSource.frame}`}
+                alt={`Live Dev1 attendance camera input for ${selectedCentre}`}
+                style={{
+                  width: '100%',
+                  height: '300px',
+                  objectFit: 'contain',
+                  display: 'block'
+                }}
+              />
+            ) : (
+              <div style={{ padding: '24px' }}>
+                <div style={styles.scanPlaceholderIcon}>
+                  <ScanLine size={30} />
+                </div>
+                <strong>Waiting for the shared camera feed</strong>
+                <p>
+                  Dev1's live camera input appears here first. Dev2 adds equipment detections to these same frames when its producer is running.
+                </p>
+              </div>
+            )}
+            <div style={{
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              bottom: 0,
+              padding: '8px 12px',
+              background: 'rgba(15, 23, 42, 0.88)',
+              color: '#fff',
+              fontSize: '12px',
+              textAlign: 'left'
+            }}>
+              {infraFrameData && selectedLiveInfraAudit?.sourceMatchesCentre
+                ? `DEV2 ${liveInfraFresh ? 'LIVE · SHARED CAMERA' : 'STALE'}`
+                : attendanceSourceFresh
+                  ? `DEV1 SOURCE PREVIEW · DEV2 ${infraConnection} · ${attendanceSource.cameraId} · ${attendanceSourceAgeLabelSeconds}s ago`
+                    : `DEV1 ${attendanceSourceFresh ? attendanceSourceStatus : attendanceSource ? 'STALE' : attendanceSourceStatus} · DEV2 ${infraConnection}`}
+              {infraFrameData && liveInfraAudit && ` · ${liveInfraAudit.detected}/${liveInfraAudit.required} computers`}
+              {infraFrameData && liveInfraAudit?.cameraId && ` · ${liveInfraAudit.cameraId}`}
+              {infraFrameData && infraAgeLabelSeconds !== null && ` · ${infraAgeLabelSeconds}s ago`}
             </div>
-
-            <strong>
-              Infrastructure Vision Pipeline
-            </strong>
-
-            <p>
-              Captured images are stored as audit evidence. The current mock detector does not inspect them; its illustrative counts are clearly marked as simulated.
-            </p>
-
-            <div
-              style={
-                styles.scanPipeline
-              }
-            >
-
-              <span>
-                Camera
-              </span>
-
-              <ChevronRight size={14} />
-
-              <span>
-                Mock
-              </span>
-
-              <ChevronRight size={14} />
-
-              <span>
-                Object Count
-              </span>
-
-              <ChevronRight size={14} />
-
-              <span>
-                Compliance
-              </span>
-
-            </div>
-
           </div>
 
         </div>
@@ -5547,7 +5994,7 @@ function InfrastructurePage({
                           }
                         >
                           {log.detection_source === 'SIMULATED'
-                            ? `SIMULATED · ${log.status || 'REVIEW'}`
+                            ? `LEGACY SIMULATED · ${log.status || 'REVIEW'}`
                             : log.status || 'REVIEW'}
                         </span>
 
@@ -5555,7 +6002,9 @@ function InfrastructurePage({
 
                       <td style={styles.td}>
                         <span style={log.detection_source === 'SIMULATED' ? styles.tagWarning : styles.tagSafe}>
-                          {log.detection_source || 'UNKNOWN'}
+                          {log.detection_source === 'SIMULATED'
+                            ? 'LEGACY SIMULATED'
+                            : log.detection_source || 'UNKNOWN'}
                         </span>
                       </td>
 
@@ -5634,9 +6083,9 @@ function InfrastructurePage({
 
             <div style={styles.modalBody}>
               <div style={styles.infoCard}>
-                <div style={styles.infoCardTitle}>Prototype detection notice</div>
+                <div style={styles.infoCardTitle}>Real detector and evidence notice</div>
                 <div style={styles.infoCardText}>
-                    This workflow stores captured images as audit evidence. Counts remain simulated until Dev 2 connects the trained detector; avoid capturing identifiable learners. Access is recorded under your authenticated user role.
+                    Dev2's trained model analyzes each submitted view. Original images, annotated detections, confidence scores, and model details are stored with the audit; avoid capturing identifiable learners. Access is recorded under your authenticated user role.
                 </div>
               </div>
 
@@ -5838,25 +6287,27 @@ function InfrastructurePage({
 
                 {scanResults && (
                   <div>
-                    <div style={{ ...styles.errorNotice, marginBottom: '12px' }} role="status">
-                      SIMULATED RESULT — these counts were generated for workflow testing and were not detected in your photos. Do not use this compliance score for a real centre assessment.
-                    </div>
                     <div style={styles.stepHeader}>
                       <span style={{ ...styles.stepNumber, background: '#15803d' }}>3</span>
                       <div>
-                        <div style={styles.stepTitle}>Simulated workflow result: {scanResults.status}</div>
+                        <div style={styles.stepTitle}>Dev2 YOLO result: {scanResults.status}</div>
                         <div style={styles.stepSubtitle}>
-                          {scanResults.compliance_percentage}% illustrative weighted score · {scanResults.views_captured} views · {new Date(scanResults.timestamp).toLocaleString()}
+                          {scanResults.compliance_percentage}% supported-class compliance · {scanResults.views_captured} analyzed views · {scanResults.model} · {scanResults.device} · {new Date(scanResults.timestamp).toLocaleString()}
                         </div>
                       </div>
                     </div>
+                    {scanResults.unsupported_classes?.length > 0 && (
+                      <div style={{ ...styles.warningStrip, marginBottom: '12px' }} role="status">
+                        Dev2 does not detect these configured classes: {scanResults.unsupported_classes.join(', ')}. They are excluded from the compliance score; the audit remains in review.
+                      </div>
+                    )}
                     <div style={styles.tableScroll}>
                       <table style={styles.table}>
                         <thead>
                           <tr>
                             <th style={styles.th}>Equipment</th>
                             <th style={styles.th}>Required</th>
-                            <th style={styles.th}>Simulated count</th>
+                            <th style={styles.th}>Detected</th>
                             <th style={styles.th}>Missing</th>
                           </tr>
                         </thead>
@@ -5865,12 +6316,32 @@ function InfrastructurePage({
                             <tr key={item.name} style={styles.tr}>
                               <td style={styles.td}>{item.label}</td>
                               <td style={styles.td}>{item.required}</td>
-                              <td style={styles.td}>{item.detected}</td>
-                              <td style={styles.td}>{item.missing}</td>
+                              <td style={styles.td}>{item.detected ?? 'Not supported'}</td>
+                              <td style={styles.td}>{item.missing ?? '—'}</td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
+                    </div>
+                    <h4 style={{ margin: '16px 0 8px' }}>Annotated detections by view</h4>
+                    <div style={styles.evidenceGallery}>
+                      {scanResults.annotated_images?.map((image, index) => {
+                        const view = scanResults.views?.[index];
+                        return (
+                          <figure key={`annotated-${index}`} style={{ margin: 0 }}>
+                            <img
+                              src={image}
+                              alt={`Dev2 annotated detection view ${index + 1}`}
+                              style={styles.evidenceImg}
+                            />
+                            <figcaption style={{ ...styles.miniText, marginTop: '6px' }}>
+                              View {index + 1}: {(view?.detections || []).map(
+                                detection => `${detection.class_name} ${Math.round(detection.confidence * 100)}%`
+                              ).join(', ') || 'No supported objects detected'}
+                            </figcaption>
+                          </figure>
+                        );
+                      })}
                     </div>
                   </div>
                 )}
@@ -5904,7 +6375,7 @@ function InfrastructurePage({
                   onClick={submitScan}
                 >
                   <ScanLine size={14} />
-                  {scanLoading ? 'Running simulated scan…' : 'Run simulated audit'}
+                  {scanLoading ? 'Analyzing images with Dev2…' : 'Run Dev2 infrastructure audit'}
                 </button>
               )}
             </footer>
@@ -5939,19 +6410,61 @@ function InfrastructurePage({
                 <div style={styles.errorNotice} role="alert">{evidenceReview.error}</div>
               )}
               {!evidenceReview.loading && !evidenceReview.error && (
-                <div style={styles.evidenceGallery}>
-                  {evidenceReview.images.map((image, index) => (
-                    <figure key={`${index}-${image.length}`} style={{ margin: 0 }}>
-                      <img
-                        src={image}
-                        alt={`Stored scan evidence view ${index + 1}`}
-                        style={styles.evidenceImg}
-                      />
-                      <figcaption style={{ ...styles.miniText, textAlign: 'center' }}>
-                        View {index + 1}
-                      </figcaption>
-                    </figure>
-                  ))}
+                <div>
+                  <p style={styles.miniText}>
+                    Source: {evidenceReview.results?.model
+                      ? `Dev2 YOLO · ${evidenceReview.results.model} · ${evidenceReview.results.device}`
+                      : 'Legacy or unavailable detector metadata'}
+                  </p>
+                  <h3>Original evidence</h3>
+                  <div style={styles.evidenceGallery}>
+                    {evidenceReview.images.map((image, index) => (
+                      <figure key={`original-${index}-${image.length}`} style={{ margin: 0 }}>
+                        <img
+                          src={image}
+                          alt={`Stored original scan view ${index + 1}`}
+                          style={styles.evidenceImg}
+                        />
+                        <figcaption style={{ ...styles.miniText, textAlign: 'center' }}>
+                          Original view {index + 1}
+                        </figcaption>
+                      </figure>
+                    ))}
+                  </div>
+                  <h3>Dev2 annotated detections</h3>
+                  {evidenceReview.annotatedImages.length ? (
+                    <div style={styles.evidenceGallery}>
+                      {evidenceReview.annotatedImages.map((image, index) => {
+                        const view = evidenceReview.results?.views?.[index];
+                        return (
+                          <figure key={`annotated-${index}-${image.length}`} style={{ margin: 0 }}>
+                            <img
+                              src={image}
+                              alt={`Dev2 annotated scan view ${index + 1}`}
+                              style={styles.evidenceImg}
+                            />
+                            <figcaption style={{ ...styles.miniText, marginTop: '6px' }}>
+                              View {index + 1}
+                              {(view?.detections || []).map((detection, detectionIndex) => (
+                                <div key={`${detection.class_name}-${detectionIndex}`}>
+                                  {detection.class_name} · {Math.round(detection.confidence * 100)}% · box [
+                                  {detection.bbox.map(value => Math.round(value)).join(', ')}]
+                                </div>
+                              ))}
+                              {!view?.detections?.length && <div>No supported objects detected</div>}
+                            </figcaption>
+                          </figure>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p style={styles.miniText}>This record has no stored model-annotated images.</p>
+                  )}
+                  {evidenceReview.results?.unsupported_classes?.length > 0 && (
+                    <div style={{ ...styles.warningStrip, marginTop: '12px' }}>
+                      Not supported by this model: {evidenceReview.results.unsupported_classes.join(', ')}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
