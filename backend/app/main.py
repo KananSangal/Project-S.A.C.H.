@@ -3,15 +3,18 @@ from datetime import date, datetime
 from datetime import timedelta, timezone
 from typing import Optional, Generator, TypedDict
 from zoneinfo import ZoneInfo
+import asyncio
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import re
 import secrets
 import statistics
+import subprocess
 
-from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import create_engine, String, Integer, Float, Text, ForeignKey, UniqueConstraint, select, and_, or_, inspect, text, func, update
@@ -20,7 +23,6 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship,
 import csv
 import io
 import json
-import random
 from fastapi.responses import StreamingResponse
 from fastapi.responses import JSONResponse
 
@@ -96,6 +98,7 @@ class AuditRecord(Base):
     timestamp: Mapped[str] = mapped_column(String(80), nullable=False)
     evidence_image: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # base64 encoded image
     evidence_images: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    annotated_images: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     equipment_results: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     detection_source: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     archived_at: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
@@ -204,6 +207,235 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logger = logging.getLogger(__name__)
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[tuple[str, str], set[WebSocket]] = {}
+        self.latest_frames: dict[tuple[str, str], dict] = {}
+
+    async def connect(
+        self,
+        websocket: WebSocket,
+        centre_id: str,
+        stream_type: str,
+        already_accepted: bool = False,
+    ):
+        if not already_accepted:
+            await websocket.accept()
+        key = (centre_id, stream_type)
+        self.active_connections.setdefault(key, set()).add(websocket)
+        latest_frame = self.latest_frames.get(key)
+        if latest_frame is not None:
+            await websocket.send_json(latest_frame)
+
+    def disconnect(self, websocket: WebSocket, centre_id: str, stream_type: str):
+        key = (centre_id, stream_type)
+        connections = self.active_connections.get(key)
+        if connections is None:
+            return
+        connections.discard(websocket)
+        if not connections:
+            self.active_connections.pop(key, None)
+
+    async def broadcast(self, centre_id: str, stream_type: str, message: dict):
+        key = (centre_id, stream_type)
+        message = {
+            **message,
+            "centre_id": centre_id,
+            "stream_type": stream_type,
+            "received_at": _utc_now().isoformat(),
+        }
+        self.latest_frames[key] = message
+        connections = self.active_connections.get(key, set()).copy()
+        if not connections:
+            return
+
+        results = await asyncio.gather(
+            *(
+                asyncio.wait_for(connection.send_json(message), timeout=2)
+                for connection in connections
+            ),
+            return_exceptions=True,
+        )
+        for connection, result in zip(connections, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Dropping live-feed WebSocket for %s/%s: %s",
+                    centre_id,
+                    stream_type,
+                    result,
+                )
+                self.disconnect(connection, centre_id, stream_type)
+
+
+connection_manager = ConnectionManager()
+
+
+def _lookup_websocket_user(token: str) -> Optional[dict]:
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with SessionLocal() as db:
+        session = db.scalar(
+            select(AuthSession).where(AuthSession.token_hash == token_hash)
+        )
+        user = db.get(AuthUser, session.user_id) if session else None
+        if (
+            session is None
+            or user is None
+            or not user.is_active
+            or session.revoked_at is not None
+        ):
+            return None
+        expires_at = datetime.fromisoformat(session.expires_at)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= _utc_now():
+            return None
+        return _user_to_dict(user)
+
+
+def _websocket_role_allowed(
+    user: dict,
+    centre_id: str,
+    stream_type: str,
+    upload: bool,
+) -> bool:
+    if stream_type not in {"attendance", "infra"}:
+        return False
+    role = user.get("role")
+    if upload:
+        api_path = (
+            "/api/attendance/log"
+            if stream_type == "attendance"
+            else "/api/audit/live"
+        )
+        if not _role_allowed("POST", api_path, role):
+            return False
+    elif role not in AUTH_ROLES:
+        return False
+    return not _is_operator_role(role) or user.get("centre_id") == centre_id
+
+
+async def _authenticate_websocket(
+    websocket: WebSocket,
+    centre_id: str,
+    stream_type: str,
+    upload: bool,
+) -> Optional[str]:
+    await websocket.accept()
+    try:
+        credentials = await asyncio.wait_for(websocket.receive_json(), timeout=5)
+        token = credentials.get("token") if isinstance(credentials, dict) else None
+        if not isinstance(token, str) or not token:
+            raise ValueError("Missing bearer token")
+        user = await asyncio.to_thread(_lookup_websocket_user, token)
+        if user is None or not _websocket_role_allowed(
+            user, centre_id, stream_type, upload
+        ):
+            raise ValueError("Invalid or unauthorized session")
+        await websocket.send_json({"type": "authenticated"})
+        return token
+    except (asyncio.TimeoutError, ValueError, WebSocketDisconnect):
+        await websocket.close(code=1008, reason="Authentication required")
+        return None
+
+
+async def _websocket_session_is_valid(
+    token: str,
+    centre_id: str,
+    stream_type: str,
+    upload: bool,
+) -> bool:
+    user = await asyncio.to_thread(_lookup_websocket_user, token)
+    return user is not None and _websocket_role_allowed(
+        user, centre_id, stream_type, upload
+    )
+
+
+@app.websocket("/ws/stream_upload/{centre_id}/{stream_type}")
+async def stream_upload(websocket: WebSocket, centre_id: str, stream_type: str):
+    token = await _authenticate_websocket(
+        websocket, centre_id, stream_type, upload=True
+    )
+    if token is None:
+        return
+    validation_due = asyncio.get_running_loop().time() + 60
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(
+                    websocket.receive_json(), timeout=60
+                )
+            except asyncio.TimeoutError:
+                if not await _websocket_session_is_valid(
+                    token, centre_id, stream_type, upload=True
+                ):
+                    await websocket.close(code=1008, reason="Session expired")
+                    return
+                validation_due = asyncio.get_running_loop().time() + 60
+                continue
+            if asyncio.get_running_loop().time() >= validation_due:
+                if not await _websocket_session_is_valid(
+                    token, centre_id, stream_type, upload=True
+                ):
+                    await websocket.close(code=1008, reason="Session expired")
+                    return
+                validation_due = asyncio.get_running_loop().time() + 60
+            if (
+                not isinstance(message, dict)
+                or not isinstance(message.get("frame"), str)
+                or not message["frame"]
+            ):
+                await websocket.close(code=1003, reason="Expected a base64 frame")
+                return
+            if stream_type == "infra":
+                if not _infra_frame_matches_source(centre_id, message):
+                    await websocket.close(
+                        code=1008,
+                        reason="Infrastructure frames must come from this centre's attendance feed",
+                    )
+                    return
+                message = _canonical_live_infrastructure_message(
+                    centre_id, message
+                )
+            await connection_manager.broadcast(centre_id, stream_type, message)
+    except WebSocketDisconnect:
+        return
+    except ValueError:
+        await websocket.close(code=1003, reason="Invalid JSON frame")
+
+
+@app.websocket("/ws/live_feed/{centre_id}/{stream_type}")
+async def live_feed(websocket: WebSocket, centre_id: str, stream_type: str):
+    token = await _authenticate_websocket(
+        websocket, centre_id, stream_type, upload=False
+    )
+    if token is None:
+        return
+    await connection_manager.connect(
+        websocket, centre_id, stream_type, already_accepted=True
+    )
+    validation_due = asyncio.get_running_loop().time() + 60
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=60)
+            except asyncio.TimeoutError:
+                pass
+            if asyncio.get_running_loop().time() >= validation_due:
+                if not await _websocket_session_is_valid(
+                    token, centre_id, stream_type, upload=False
+                ):
+                    await websocket.close(code=1008, reason="Session expired")
+                    return
+                validation_due = asyncio.get_running_loop().time() + 60
+    except WebSocketDisconnect:
+        pass
+    finally:
+        connection_manager.disconnect(websocket, centre_id, stream_type)
+
+
 AUTH_TOKEN_LIFETIME = timedelta(hours=8)
 AUTH_ROLES = {"ADMIN", "OFFICIAL", "AUDITOR", "OPERATOR", "CENTRE_OPERATOR"}
 OPERATOR_ROLES = {"OPERATOR", "CENTRE_OPERATOR"}
@@ -245,6 +477,7 @@ db_store = {
     "audit_logs": [],
     "centres": {},
 }
+live_infrastructure: dict[str, dict] = {}
 
 
 class LoginRequest(BaseModel):
@@ -507,6 +740,7 @@ def _role_allowed(method: str, path: str, role: str) -> bool:
     if method == "POST" and path in {
         "/api/attendance/log",
         "/api/audit/submit",
+        "/api/audit/live",
     }:
         return role in {"ADMIN", "OFFICIAL"} | OPERATOR_ROLES and (
             path == "/api/attendance/log" or not is_operator
@@ -1493,6 +1727,31 @@ class AuditSubmission(BaseModel):
         return value
 
 
+class LiveInfrastructureUpdate(BaseModel):
+    centre_id: str = Field(min_length=1, max_length=100)
+    detected_computers: int = Field(ge=0, le=10000)
+    timestamp: Optional[str] = None
+
+    @field_validator("centre_id")
+    @classmethod
+    def validate_centre_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value or value.lower() == "string":
+            raise ValueError("A valid centre_id is required")
+        return value
+
+    @field_validator("timestamp")
+    @classmethod
+    def validate_timestamp(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("timestamp must be an ISO-8601 datetime") from error
+        return value
+
+
 class EquipmentClassConfig(BaseModel):
     name: str = Field(min_length=2, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
     label: str = Field(min_length=1, max_length=100)
@@ -1666,6 +1925,56 @@ def centre_to_dict(record: CentreRecord) -> dict:
     }
 
 
+def _configured_computer_requirement(centre: dict) -> int:
+    equipment_config = centre.get("equipment_config") or {}
+    for item in equipment_config.get("classes", []):
+        if item.get("name") == "computer":
+            return max(0, int(item["required"]))
+    return max(0, int(centre.get("required_computers", 0)))
+
+
+def _live_computer_compliance(centre: dict, detected: int) -> dict:
+    required = _configured_computer_requirement(centre)
+    compliance = min(100.0, detected / required * 100) if required else 100.0
+    return {
+        "required_computers": required,
+        "compliance_percentage": round(compliance, 1),
+        "status": (
+            "COMPLIANT" if compliance >= 80
+            else "PARTIAL" if compliance >= 50
+            else "DEFICIENT"
+        ),
+    }
+
+
+def _canonical_live_infrastructure_message(
+    centre_id: str,
+    message: dict,
+) -> dict:
+    detected = message.get("detected_computers")
+    centre = db_store["centres"].get(centre_id)
+    if (
+        not isinstance(detected, int)
+        or isinstance(detected, bool)
+        or detected < 0
+        or centre is None
+    ):
+        return message
+    return {
+        **message,
+        **_live_computer_compliance(centre, detected),
+    }
+
+
+def _infra_frame_matches_source(centre_id: str, message: dict) -> bool:
+    return (
+        message.get("source_stream") == "attendance"
+        and message.get("source_centre_id") == centre_id
+        and isinstance(message.get("camera_id"), str)
+        and bool(message["camera_id"].strip())
+    )
+
+
 def persist_centre(db: Session, centre_id: str, centre: dict) -> CentreRecord:
     record = db.get(CentreRecord, centre_id)
     if record is None:
@@ -1684,6 +1993,22 @@ def persist_centre(db: Session, centre_id: str, centre: dict) -> CentreRecord:
 def refresh_cache(db: Session) -> None:
     """Refresh the cache from persistent SQLite records, excluding placeholder string data."""
     centres = db.scalars(select(CentreRecord).where(CentreRecord.centre_id != "string")).all()
+    latest_attendance_ids = (
+        select(func.max(AttendanceRecord.id).label("latest_id"))
+        .where(AttendanceRecord.centre_id != "string")
+        .group_by(AttendanceRecord.centre_id)
+        .subquery()
+    )
+    latest_attendance = db.scalars(
+        select(AttendanceRecord).where(
+            AttendanceRecord.id.in_(
+                select(latest_attendance_ids.c.latest_id)
+            )
+        )
+    ).all()
+    latest_attendance_at = {
+        row.centre_id: row.timestamp for row in latest_attendance
+    }
     cached_centres = {}
     for row in centres:
         centre = centre_to_dict(row)
@@ -1698,6 +2023,7 @@ def refresh_cache(db: Session) -> None:
             "attendance_gap_duration_seconds": signal["gap_duration_seconds"],
             "attendance_gap_active": signal["gap_persisted"],
             "attendance_gap_started_at": signal["gap_started_at"],
+            "last_attendance_at": latest_attendance_at.get(row.centre_id),
         })
         cached_centres[row.centre_id] = centre
     db_store["centres"] = cached_centres
@@ -1730,6 +2056,7 @@ def refresh_cache(db: Session) -> None:
                 len(json.loads(row.evidence_images))
                 if row.evidence_images else int(bool(row.evidence_image))
             ),
+            "detections_available": bool(row.equipment_results),
             "equipment_results": json.loads(row.equipment_results) if row.equipment_results else None,
             "detection_source": row.detection_source or "UNKNOWN",
             "archived_at": row.archived_at,
@@ -1755,6 +2082,7 @@ def initialize_database() -> None:
             ("auth_users", "centre_id", "VARCHAR(100)"),
             ("audit_logs", "evidence_image", "TEXT"),
             ("audit_logs", "evidence_images", "TEXT"),
+            ("audit_logs", "annotated_images", "TEXT"),
             ("audit_logs", "equipment_results", "TEXT"),
             ("audit_logs", "detection_source", "VARCHAR(30)"),
             ("audit_logs", "archived_at", "VARCHAR(80)"),
@@ -1925,15 +2253,31 @@ def submit_audit(data: AuditSubmission, db: Session = Depends(get_db)):
     return {"status": "SUCCESS", "received": log_entry, "updated_centre": centre}
 
 
+@app.post("/api/audit/live")
+def submit_live_infrastructure(data: LiveInfrastructureUpdate, db: Session = Depends(get_db)):
+    record = db.get(CentreRecord, data.centre_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Centre '{data.centre_id}' not found",
+        )
+
+    centre = centre_to_dict(record)
+    received_at = _utc_now().isoformat()
+    live_status = {
+        "centre_id": data.centre_id,
+        "detected_computers": data.detected_computers,
+        **_live_computer_compliance(centre, data.detected_computers),
+        "timestamp": data.timestamp or received_at,
+        "received_at": received_at,
+    }
+    live_infrastructure[data.centre_id] = live_status
+    return {"status": "SUCCESS", "live": live_status}
+
+
 # ============================================================
 # INFRASTRUCTURE SCAN API (Feature 2 — Start New Scan)
 # ============================================================
-
-
-class MockDetection(BaseModel):
-    equipment: dict[str, int]
-    centre: str
-    timestamp: str
 
 
 class ScanSubmission(BaseModel):
@@ -2014,27 +2358,92 @@ def _validate_evidence_image(value: str, max_bytes: int) -> str:
     return value
 
 
-def _mock_yolo_detect(
-    centre_id: str, equipment_config: dict
-) -> MockDetection:
-    """
-    Simulates equipment detections from the classes configured for a centre.
+DEV2_ROOT = Path(os.getenv("SACH_DEV2_ROOT", str(BASE_DIR.parent.parent / "dev2")))
+DEV2_PYTHON = os.getenv(
+    "SACH_DEV2_PYTHON",
+    str(
+        DEV2_ROOT
+        / ".venv"
+        / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    ),
+)
+DEV2_INFERENCE_SCRIPT = DEV2_ROOT / "inference_cli.py"
 
-    Dev 2 will replace this with the real detector. Until then, this
-    function produces repeatable pseudo-random counts; it does not inspect
-    the evidence image and must not be presented as real model inference.
-    """
-    seed = int.from_bytes(hashlib.sha256(centre_id.encode("utf-8")).digest()[:8], "big")
-    rng = random.Random(seed)
-    detected: dict[str, int] = {}
-    for item in equipment_config["classes"]:
-        detected[item["name"]] = max(0, item["required"] + rng.randint(-4, 6))
 
-    return MockDetection(
-        equipment=detected,
-        centre=centre_id,
-        timestamp=datetime.now().isoformat(),
-    )
+def _run_dev2_inference(evidence_images: list[str], required: dict[str, int]) -> dict:
+    interpreter = Path(DEV2_PYTHON)
+    if not interpreter.is_file() or not DEV2_INFERENCE_SCRIPT.is_file():
+        logger.error(
+            "Dev2 inference is not configured: python=%s, script=%s",
+            interpreter,
+            DEV2_INFERENCE_SCRIPT,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The Dev2 infrastructure detector is unavailable. "
+                "Configure SACH_DEV2_PYTHON and check the Dev2 model files."
+            ),
+        )
+
+    payload = json.dumps({
+        "images": evidence_images,
+        "required": required,
+    })
+    try:
+        process = subprocess.run(
+            [str(interpreter), str(DEV2_INFERENCE_SCRIPT)],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            cwd=DEV2_ROOT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        logger.error("Dev2 infrastructure inference exceeded its 180-second timeout")
+        raise HTTPException(
+            status_code=504,
+            detail="The Dev2 detector timed out. Try fewer or smaller evidence images.",
+        ) from error
+    except OSError as error:
+        logger.exception("Could not start the Dev2 infrastructure detector")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not start the Dev2 detector. Check backend logs.",
+        ) from error
+
+    if process.returncode != 0:
+        logger.error("Dev2 inference failed: %s", process.stderr[-4000:])
+        raise HTTPException(
+            status_code=502,
+            detail="The Dev2 detector failed to analyze this scan. Check backend logs.",
+        )
+
+    try:
+        result = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        logger.error("Dev2 inference returned invalid JSON: %s", process.stderr[-4000:])
+        raise HTTPException(
+            status_code=502,
+            detail="The Dev2 detector returned an invalid result. Check backend logs.",
+        ) from error
+
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("detected"), dict)
+        or not isinstance(result.get("views"), list)
+        or len(result["views"]) != len(evidence_images)
+        or not isinstance(result.get("annotated_images"), list)
+        or len(result["annotated_images"]) != len(evidence_images)
+        or not isinstance(result.get("supported_classes"), list)
+    ):
+        logger.error("Dev2 inference result did not match the submitted evidence views")
+        raise HTTPException(
+            status_code=502,
+            detail="The Dev2 detector returned an incomplete result. Check backend logs.",
+        )
+    return result
 
 
 @app.get("/api/centres/{centre_id}/equipment-config")
@@ -2106,34 +2515,62 @@ def run_infrastructure_scan(centre_id: str, data: ScanSubmission, db: Session = 
             ]
         }
 
-    result = _mock_yolo_detect(centre_id, equipment_config)
+    required = {
+        item["name"]: item["required"]
+        for item in equipment_config["classes"]
+    }
+    inference = _run_dev2_inference(evidence_images, required)
+    detected_equipment = inference["detected"]
 
+    supported_classes = set(inference["supported_classes"])
+    unsupported_classes = sorted(set(required) - supported_classes)
     class_results = []
     for item in equipment_config["classes"]:
         required_count = item["required"]
-        detected_count = result.equipment[item["name"]]
+        is_supported = item["name"] in supported_classes
+        detected_count = (
+            int(detected_equipment.get(item["name"], 0))
+            if is_supported else None
+        )
         class_results.append({
             **item,
             "detected": detected_count,
-            "missing": max(0, required_count - detected_count),
+            "missing": max(0, required_count - detected_count) if is_supported else None,
             "compliance_percentage": (
                 min(100.0, round(detected_count / required_count * 100, 1))
-                if required_count > 0 else 100.0
+                if required_count > 0 and is_supported
+                else 100.0 if is_supported else None
             ),
         })
 
-    total_required = sum(item["required"] for item in class_results)
+    supported_results = [item for item in class_results if item["detected"] is not None]
+    total_required = sum(item["required"] for item in supported_results)
     compliant_total = sum(
         min(item["detected"], item["required"]) for item in class_results
+        if item["detected"] is not None
     )
     compliance = (
         round(compliant_total / total_required * 100, 1)
-        if total_required > 0 else 100.0
+        if total_required > 0
+        else 0.0 if unsupported_classes else 100.0
     )
-    status = "PASS" if compliance >= 80 else "REVIEW"
+    status = (
+        "REVIEW"
+        if unsupported_classes or compliance < 80
+        else "PASS"
+    )
 
-    detected_computers = result.equipment["computer"]
+    detected_computers = int(detected_equipment.get("computer", 0))
     required_computers = record.required_computers
+    timestamp = _utc_now().isoformat()
+    detection_results = {
+        "model": inference["model"],
+        "device": inference["device"],
+        "views": inference["views"],
+        "classes": class_results,
+        "unsupported_classes": unsupported_classes,
+        "compliance_scope": "Dev2-supported equipment classes only",
+    }
 
     log_entry = {
         "centre_id": centre_id,
@@ -2141,11 +2578,12 @@ def run_infrastructure_scan(centre_id: str, data: ScanSubmission, db: Session = 
         "required_computers": required_computers,
         "compliance_percentage": compliance,
         "status": status,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": timestamp,
         "evidence_image": evidence_images[0],
         "evidence_images": json.dumps(evidence_images),
-        "equipment_results": json.dumps(class_results),
-        "detection_source": "SIMULATED",
+        "annotated_images": json.dumps(inference["annotated_images"]),
+        "equipment_results": json.dumps(detection_results),
+        "detection_source": "DEV2_YOLO",
     }
 
     db.add(AuditRecord(**log_entry))
@@ -2154,19 +2592,29 @@ def run_infrastructure_scan(centre_id: str, data: ScanSubmission, db: Session = 
 
     return {
         "centre_id": centre_id,
-        "detected": result.equipment,
+        "detected": detected_equipment,
         "classes": class_results,
+        "views": inference["views"],
+        "annotated_images": inference["annotated_images"],
+        "model": inference["model"],
+        "device": inference["device"],
+        "unsupported_classes": unsupported_classes,
+        "compliance_scope": "Dev2-supported equipment classes only",
         "detected_computers": detected_computers,
         "required_computers": required_computers,
-        "total_detected": sum(item["detected"] for item in class_results),
+        "total_detected": sum(
+            item["detected"]
+            for item in class_results
+            if item["detected"] is not None
+        ),
         "total_required": total_required,
         "compliance_percentage": compliance,
         "status": status,
         "submission_status": "SUCCESS",
-        "detection_source": "SIMULATED",
+        "detection_source": "DEV2_YOLO",
         "authoritative_centre_metrics_updated": False,
         "views_captured": len(evidence_images),
-        "timestamp": result.timestamp,
+        "timestamp": timestamp,
     }
 
 
@@ -2181,11 +2629,17 @@ def get_audit_evidence(audit_id: int, db: Session = Depends(get_db)):
         if audit.evidence_images
         else [audit.evidence_image] if audit.evidence_image else []
     )
+    annotated_images = (
+        json.loads(audit.annotated_images)
+        if audit.annotated_images else []
+    )
     return {
         "audit_id": audit.id,
         "centre_id": audit.centre_id,
         "detection_source": audit.detection_source or "UNKNOWN",
         "images": images,
+        "annotated_images": annotated_images,
+        "results": json.loads(audit.equipment_results) if audit.equipment_results else None,
     }
 
 
@@ -2227,6 +2681,10 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
     return {
         "total_centres_monitored": len(db_store["centres"]),
         "centres": db_store["centres"],
+        "live_infrastructure": {
+            centre_id: update.copy()
+            for centre_id, update in live_infrastructure.items()
+        },
         "recent_attendance_logs": db_store["attendance_logs"][-10:],
         "recent_audit_logs": db_store["audit_logs"][-100:],
     }
